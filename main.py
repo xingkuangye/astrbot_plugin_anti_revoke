@@ -264,7 +264,6 @@ class AntiRevoke(Star):
                     if segment.get("type") == "file":
                         file_name = segment.get("data", {}).get("file")
                         file_size = segment.get("data", {}).get("file_size")
-                        logger.info(f"[AntiRevoke] 解析到文件组件，名称: {file_name}, 大小: {file_size}")
                         if file_name:
                             raw_file_names.append(file_name)
                         if file_size:
@@ -278,7 +277,6 @@ class AntiRevoke(Star):
                         if file_id and file_size:
                             try:
                                 raw_video_sizes[file_id] = int(file_size) if isinstance(file_size, str) else file_size
-                                logger.info(f"[AntiRevoke] 解析到视频组件，ID: {file_id}, 大小: {file_size}")
                             except ValueError:
                                 logger.warning(f"[AntiRevoke] 无法解析视频大小: {file_size}")
             except Exception as e:
