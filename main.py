@@ -25,7 +25,7 @@ async def delayed_delete(delay: int, path: Path):
     await asyncio.sleep(delay)
     try:
         path.unlink(missing_ok=True)
-        logger.debug(f"[AntiRevoke] 缓存清理：已删除过期文件 {path.name}")
+        logger.debug(f"[AntiRevoke] 已自动删除过期缓存文件: {path.name}")
     except Exception:
         logger.error(f"[AntiRevoke] 删除文件失败 ({path}): {traceback.format_exc()}")
 
@@ -68,6 +68,7 @@ def _deserialize_components(comp_dicts: List[Dict]) -> List:
         'Face': Comp.Face,
         'At': Comp.At,
         'Video': Comp.Video,
+        'Record': Comp.Record,
         'File': Comp.File,
         'Json': Comp.Json,
     }
@@ -110,7 +111,7 @@ async def _download_and_cache_image(session: aiohttp.ClientSession, component: C
                 logger.warning(f"[AntiRevoke] 下载 URL 返回类型非图片: {content_type}"); return None
             image_bytes = await response.read()
             with open(temp_file_path, 'wb') as f: f.write(image_bytes)
-        logger.info(f"[AntiRevoke] 图片成功缓存到本地: {temp_file_path.name}")
+        logger.debug(f"[AntiRevoke] 图片成功缓存到本地: {temp_file_path.name}")
         return str(temp_file_path.absolute())
     except Exception as e:
         logger.error(f"[AntiRevoke] ❌ 图片下载或保存失败 ({image_url}): {e}")
@@ -130,7 +131,7 @@ async def _process_component_and_get_gocq_part(
         if face_id is not None: gocq_parts.append({"type": "face", "data": {"id": int(face_id)}})
     elif comp_type_name == 'At':
         qq = getattr(comp, 'qq', '未知QQ')
-        name = getattr(comp, 'name', f'@{qq}')
+        name = getattr(comp, 'name', f'@{{{qq}}}')
         at_text = f"@{name}({qq})"
         gocq_parts.append({"type": "text", "data": {"text": at_text}})
     elif comp_type_name == 'Image':
@@ -151,6 +152,15 @@ async def _process_component_and_get_gocq_part(
         else:
             logger.error(f"[AntiRevoke] ❌ 准备发送视频时失败：缓存的视频文件已丢失，路径: {cached_video_path_str}")
             gocq_parts.append({"type": "text", "data": {"text": f"[错误：撤回的视频文件已丢失]"}})
+    elif comp_type_name == 'Record':
+        cached_voice_path_str = getattr(comp, 'file', None)
+        if cached_voice_path_str and Path(cached_voice_path_str).exists():
+            absolute_path = str(Path(cached_voice_path_str).absolute())
+            logger.info(f"[AntiRevoke] 准备发送已缓存的语音，路径: {absolute_path}")
+            gocq_parts.append({"type": "record", "data": {"file": f"file:///{absolute_path}"}})
+        else:
+            logger.error(f"[AntiRevoke] ❌ 准备发送语音时失败：缓存的语音文件已丢失，路径: {cached_voice_path_str}")
+            gocq_parts.append({"type": "text", "data": {"text": f"[错误：撤回的语音文件已丢失]"}})
     elif comp_type_name == 'File':
         unique_key = getattr(comp, 'url', None)
         cached_file_path_str = local_file_map.get(unique_key) if local_file_map and unique_key else None
@@ -172,13 +182,15 @@ async def _process_component_and_get_gocq_part(
         else:
             logger.error(f"[AntiRevoke] ❌ 准备发送 File 时失败：缓存的文件已丢失。Key: {unique_key}")
             gocq_parts.append({"type": "text", "data": {"text": f"[错误：撤回的文件 '{original_filename or ''}' 已丢失]"}})
+    elif comp_type_name == 'Forward':
+        gocq_parts.append({"type": "text", "data": {"text": "[合并转发消息]"}})
     elif comp_type_name == 'Json':
         json_data_str = getattr(comp, 'data', '{}')
         try:
             json.loads(json_data_str)
             gocq_part = {"type": "json", "data": {"data": json_data_str}}
             gocq_parts.append(gocq_part)
-            logger.info("[AntiRevoke] ✅ Json 组件已成功打包。")
+            logger.debug("[AntiRevoke] ✅ Json 组件已成功打包。")
         except Exception as e:
             logger.error(f"[AntiRevoke] ❌ 处理 Json 组件失败，原始数据可能不是有效的 JSON: {e}")
             gocq_parts.append({"type": "text", "data": {"text": "[小程序转发失败，原始数据格式错误]"}})
@@ -186,7 +198,7 @@ async def _process_component_and_get_gocq_part(
     return gocq_parts
 
 @register(
-    "astrbot_plugin_anti_revoke", "Foolllll", "监控撤回插件", "1.0",
+    "astrbot_plugin_anti_revoke", "Foolllll", "QQ防撤回插件", "1.0",
     "https://github.com/Foolllll-J/astrbot_plugin_anti_revoke",
 )
 class AntiRevoke(Star):
@@ -205,9 +217,10 @@ class AntiRevoke(Star):
         self.temp_path.mkdir(exist_ok=True)
         self.video_cache_path = self.temp_path / "videos"
         self.video_cache_path.mkdir(exist_ok=True)
+        self.voice_cache_path = self.temp_path / "voices"
+        self.voice_cache_path.mkdir(exist_ok=True)
         self.file_cache_path = self.temp_path / "files"
         self.file_cache_path.mkdir(exist_ok=True)
-        self.forward_msg_map = {}
         self._cleanup_cache_on_startup()
     
     async def _download_video_from_url(self, url: str, save_path: Path) -> bool:
@@ -229,7 +242,7 @@ class AntiRevoke(Star):
     def _cleanup_cache_on_startup(self):
         now = time.time()
         expired_count = 0
-        for cache_dir in [self.video_cache_path, self.file_cache_path, self.temp_path]:
+        for cache_dir in [self.video_cache_path, self.voice_cache_path, self.file_cache_path, self.temp_path]:
              for file in cache_dir.glob("*"):
                  if file.is_dir(): continue
                  try:
@@ -262,13 +275,11 @@ class AntiRevoke(Star):
         
         relay_info = None
         try:
-            # 检查是否是合并转发消息
             raw_message = event.message_obj.raw_message
             message_list = raw_message.get("message", [])
             is_forward = (message_list and len(message_list) > 0 and message_list[0].get("type") == "forward")
             
             if is_forward and self.forward_relay_group:
-                # 转发到中转群
                 logger.info(f"[{self.instance_id}] 检测到合并转发消息，准备转发到中转群 {self.forward_relay_group}，原消息ID: {message_id}")
                 try:
                     client = event.bot
@@ -288,7 +299,7 @@ class AntiRevoke(Star):
                     # 如果没有获取到 message_id，通过查询群历史消息获取
                     if not relay_msg_id:
                         logger.debug(f"[{self.instance_id}] API 未返回消息ID，尝试通过查询群历史消息获取...")
-                        await asyncio.sleep(1)  # 等待1秒确保消息已发送
+                        await asyncio.sleep(1)
                         
                         try:
                             # 尝试获取自身ID以过滤消息
@@ -319,11 +330,11 @@ class AntiRevoke(Star):
                                         messages = history_result.get("messages", [])
                                 
                                 if not messages:
-                                    break
+                                    await asyncio.sleep(1)
+                                    continue
                                     
                                 # 倒序遍历（从新到旧）
                                 for msg in reversed(messages):
-                                    # 检查发送者
                                     msg_sender_id = str(msg.get("sender", {}).get("user_id", ""))
                                     if not msg_sender_id:
                                         msg_sender_id = str(msg.get("user_id", ""))
@@ -331,9 +342,8 @@ class AntiRevoke(Star):
                                     if self_id and msg_sender_id != self_id:
                                         continue
                                         
-                                    # 检查时间 (精确匹配，已确认)
                                     msg_time = int(msg.get("time", 0))
-                                    if msg_time == target_timestamp:
+                                    if abs(msg_time - target_timestamp) <= 1:
                                         found_msg = msg
                                         break
                                 
@@ -373,7 +383,6 @@ class AntiRevoke(Star):
                             "relay_timestamp": relay_msg_time, # 记录中转消息的实际时间戳
                             "group_id": group_id
                         }
-                        self.forward_msg_map[message_id] = relay_info
                         logger.info(f"[{self.instance_id}] 合并转发成功，已记录映射关系")
                         
                         # 设置自动撤回任务
@@ -420,7 +429,7 @@ class AntiRevoke(Star):
                 logger.warning(f"[AntiRevoke] 解析 raw_message 失败: {e}")
             
             local_file_map = {}
-            has_downloadable_content = any(getattr(comp.type, 'name', '') in ['Video', 'File'] for comp in components)
+            has_downloadable_content = any(getattr(comp.type, 'name', '') in ['Video', 'Record', 'File'] for comp in components)
 
             if has_downloadable_content:
                 client = event.bot
@@ -470,6 +479,31 @@ class AntiRevoke(Star):
                                 setattr(comp, 'file', f"Error: Download failed from {download_url}")
                         except Exception as e:
                             logger.error(f"[{self.instance_id}] ❌ 处理视频缓存时发生错误: {e}\n{traceback.format_exc()}")
+                            setattr(comp, 'file', "Error: Exception during cache process.")
+
+                    elif comp_type_name == 'Record':
+                        file_id = getattr(comp, 'file', None)
+                        if not file_id: continue
+                        
+                        try:
+                            ret = await client.api.call_action('get_file', **{"file_id": file_id})
+                            local_path = ret.get('file')
+
+                            if not local_path or not os.path.exists(local_path):
+                                logger.error(f"[{self.instance_id}] [Record处理] ❌ API未能提供有效的本地文件路径。返回: {ret}")
+                                setattr(comp, 'file', "Error: API did not return a valid file path.")
+                                continue
+                            
+                            original_suffix = Path(local_path).suffix or '.amr'
+                            permanent_path = self.voice_cache_path / f"{timestamp_ms}{original_suffix}"
+                            shutil.copy(local_path, permanent_path)
+
+                            setattr(comp, 'file', str(permanent_path.absolute()))
+                            asyncio.create_task(delayed_delete(self.cache_expiration_time, permanent_path))
+                            logger.debug(f"[{self.instance_id}] 语音消息已成功缓存到: {permanent_path}")
+                            
+                        except Exception as e:
+                            logger.error(f"[{self.instance_id}] ❌ 处理 Record 缓存时发生错误: {e}\n{traceback.format_exc()}")
                             setattr(comp, 'file', "Error: Exception during cache process.")
 
                     elif comp_type_name == 'File':
@@ -530,10 +564,14 @@ class AntiRevoke(Star):
                 json.dump(data_to_save, f, ensure_ascii=False, indent=2)
 
             asyncio.create_task(delayed_delete(self.cache_expiration_time, file_path))
-            logger.debug(f"[{self.instance_id}] 缓存消息成功 (ID: {message_id})，群: {group_id}")
         except Exception as e:
             logger.error(f"[{self.instance_id}] 缓存消息失败 (ID: {message_id})：{e}\n{traceback.format_exc()}")
         return None
+
+    def _create_recall_notification_header(self, group_name: str, group_id: str, member_nickname: str, sender_id: str, timestamp: int) -> str:
+        """生成统一的撤回通知消息头"""
+        message_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp)) if timestamp else "未知时间"
+        return f"【撤回提醒】\n群聊：{group_name} ({group_id})\n发送者：{member_nickname} ({sender_id})\n时间：{message_time_str}"
 
     @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
@@ -545,20 +583,25 @@ class AntiRevoke(Star):
             message_id = str(get_value(raw_message, "message_id"))
             if group_id not in self.monitor_groups or not message_id: return None
             
-            # 尝试获取消息数据（优先内存映射，其次本地缓存）
-            relay_info = self.forward_msg_map.pop(message_id, None)
-            cached_data = None
             file_path = next(self.temp_path.glob(f"*_{group_id}_{message_id}.json"), None)
-            
-            if not relay_info and file_path and file_path.exists():
+
+            cached_data = None
+
+            if file_path and file_path.exists():
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f:
                         cached_data = json.load(f)
-                    relay_info = cached_data.get("relay_info")
                 except Exception as e:
-                    logger.warning(f"[{self.instance_id}] 读取本地缓存失败: {e}")
+                    logger.warning(f"[{self.instance_id}] 读取或解析本地缓存失败: {e}")
+            
+            # 如果没有找到缓存数据，则无法恢复
+            if not cached_data:
+                logger.warning(f"[{self.instance_id}] 找不到消息记录 (ID: {message_id})，可能已过期或未缓存。")
+                return None
+            
+            # 从缓存数据中提取 relay_info，如果存在
+            relay_info = cached_data.get("relay_info")
 
-            # 如果是合并转发消息（存在 relay_info）
             if relay_info:
                 logger.info(f"[{self.instance_id}] 检测到合并转发消息被撤回，原消息ID: {message_id}")
                 sender_id = relay_info["sender_id"]
@@ -585,15 +628,14 @@ class AntiRevoke(Star):
                         member_nickname = card or nickname or member_nickname
                     except: pass
                     
-                    message_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp)) if timestamp else "未知时间"
                     logger.info(f"[{self.instance_id}] 合并转发撤回 - 群: {group_name}, 发送者: {member_nickname}")
                     
                     # 向每个接收者转发
                     for index, target_id in enumerate(self.target_receivers, 1):
                         target_id_str = str(target_id)
                         
-                        # 先发送通知
-                        notification_text = f"【撤回提醒】\n群聊：{group_name} ({group_id})\n发送者：{member_nickname} ({sender_id})\n时间：{message_time_str}\n--------------------\n以下是撤回的聊天记录："
+                        header = self._create_recall_notification_header(group_name, group_id, member_nickname, sender_id, timestamp)
+                        notification_text = f"{header}\n--------------------\n以下是撤回的聊天记录："
                         try:
                             await client.send_private_msg(user_id=int(target_id_str), message=notification_text)
                             await asyncio.sleep(0.5)
@@ -601,9 +643,8 @@ class AntiRevoke(Star):
                             logger.error(f"[{self.instance_id}] 发送合并转发通知失败到 {target_id_str}: {e}")
                             continue
                         
-                        # 从中转群转发到接收者
                         try:
-                            forward_result = await client.api.call_action(
+                            await client.api.call_action(
                                 "forward_friend_single_msg",
                                 user_id=int(target_id_str),
                                 message_id=relay_msg_id
@@ -625,13 +666,9 @@ class AntiRevoke(Star):
                 
                 return None
             
-            if cached_data or (file_path and file_path.exists()):
+            if cached_data:
                 local_files_to_cleanup = [] 
                 try:
-                    if not cached_data:
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            cached_data = json.load(f)
-                    
                     sender_id = cached_data["sender_id"]
                     local_file_map = cached_data.get("local_file_map", {})
                     if str(sender_id) in self.ignore_senders: return None
@@ -639,7 +676,7 @@ class AntiRevoke(Star):
                     cached_components_data = cached_data.get("components", [])
                     
                     unsupported_types = set()
-                    supported_types_set = {'Plain', 'Text', 'Image', 'Face', 'At', 'Video', 'Json', 'File'}
+                    supported_types_set = {'Plain', 'Text', 'Image', 'Face', 'At', 'Video', 'Record', 'Json', 'File', 'Forward'}
                     for comp_dict in cached_components_data:
                         comp_type_name = comp_dict.get('type')
                         if comp_type_name not in supported_types_set:
@@ -648,7 +685,6 @@ class AntiRevoke(Star):
                     components = _deserialize_components(cached_components_data)
 
                     timestamp = cached_data.get("timestamp")
-                    message_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp)) if timestamp else "未知时间"
                     client = event.bot
                     
                     group_name, member_nickname = str(group_id), str(sender_id)
@@ -661,14 +697,14 @@ class AntiRevoke(Star):
 
                     logger.info(f"[{self.instance_id}] 发现撤回。群: {group_name} ({group_id}), 发送者: {member_nickname} ({sender_id})")
                     
-                    special_components = [comp for comp in components if getattr(comp.type, 'name', 'unknown') in ['Video', 'Json', 'File']]
-                    other_components = [comp for comp in components if getattr(comp.type, 'name', 'unknown') not in ['Video', 'Json', 'File']]
+                    special_components = [comp for comp in components if getattr(comp.type, 'name', 'unknown') in ['Video', 'Record', 'Json', 'File', 'Forward']]
+                    other_components = [comp for comp in components if getattr(comp.type, 'name', 'unknown') not in ['Video', 'Record', 'Json', 'File', 'Forward']]
                     
                     async with aiohttp.ClientSession() as session:
                         for target_id in self.target_receivers:
                             target_id_str = str(target_id)
                             
-                            notification_prefix = f"【撤回提醒】\n群聊：{group_name} ({group_id})\n发送者：{member_nickname} ({sender_id})\n时间：{message_time_str}"
+                            notification_prefix = self._create_recall_notification_header(group_name, group_id, member_nickname, sender_id, timestamp)
                             warning_text = f"\n⚠️ 注意：包含不支持的组件：{', '.join(unsupported_types)}" if unsupported_types else ""
                             
                             if not special_components:
@@ -697,7 +733,7 @@ class AntiRevoke(Star):
                                 final_notification_text = f"{notification_prefix}{warning_text}\n--------------------\n内容将分条发送。"
                                 try:
                                     await client.send_private_msg(user_id=int(target_id_str), message=final_notification_text)
-                                except Exception as e: logger.error(f"[{self.instance_id}] ❌ 发送通知头失败到 {target_id_str}：{e}\n{traceback.format_exc}"); continue
+                                except Exception as e: logger.error(f"[{self.instance_id}] ❌ 发送通知头失败到 {target_id_str}：{e}\n{traceback.format_exc()} "); continue
                                 
                                 await asyncio.sleep(0.5)
                                 
@@ -716,24 +752,25 @@ class AntiRevoke(Star):
                                         try:
                                             await client.send_private_msg(user_id=int(target_id_str), message=content_message)
                                         except Exception as e: logger.error(f"[{self.instance_id}] ❌ 发送非特殊内容失败到 {target_id_str}：{e}\n{traceback.format_exc()}")
+                            
+                            for comp in special_components:
+                                await asyncio.sleep(0.5)
+                                comp_type_name = getattr(comp.type, 'name', 'unknown')
+                                content_parts = await _process_component_and_get_gocq_part(comp, session, self.temp_path, local_files_to_cleanup, local_file_map)
+                                final_parts_to_send = content_parts
+                                if not other_components:
+                                    prefix_part = [{"type": "text", "data": {"text": f"{member_nickname}："}}]
+                                    final_parts_to_send = prefix_part + content_parts
                                 
-                                for comp in special_components:
-                                    await asyncio.sleep(0.5)
-                                    comp_type_name = getattr(comp.type, 'name', 'unknown')
-                                    content_parts = await _process_component_and_get_gocq_part(comp, session, self.temp_path, local_files_to_cleanup, local_file_map)
-                                    final_parts_to_send = content_parts
-                                    if not other_components:
-                                        prefix_part = [{"type": "text", "data": {"text": f"{member_nickname}："}}]
-                                        final_parts_to_send = prefix_part + content_parts
-                                    
-                                    try:
-                                        await client.send_private_msg(user_id=int(target_id_str), message=final_parts_to_send)
-                                    except Exception as e: 
-                                        logger.error(f"[{self.instance_id}] ❌ 发送特殊内容 ({comp_type_name}) 失败到 {target_id_str}：{e}\n{traceback.format_exc()}")
+                                try:
+                                    await client.send_private_msg(user_id=int(target_id_str), message=final_parts_to_send)
+                                except Exception as e: 
+                                    logger.error(f"[{self.instance_id}] ❌ 发送特殊内容 ({comp_type_name}) 失败到 {target_id_str}：{e}\n{traceback.format_exc()}")
                 
                 finally:
                     if local_files_to_cleanup: asyncio.create_task(_cleanup_local_files(local_files_to_cleanup))
-                    asyncio.create_task(delayed_delete(0, file_path))
+                    if file_path:
+                        asyncio.create_task(delayed_delete(0, file_path))
             else:
                 logger.warning(f"[{self.instance_id}] 找不到消息记录 (ID: {message_id})，可能已过期或未缓存。")
         return None
