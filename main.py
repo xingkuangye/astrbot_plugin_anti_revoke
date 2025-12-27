@@ -198,7 +198,7 @@ async def _process_component_and_get_gocq_part(
     return gocq_parts
 
 @register(
-    "astrbot_plugin_anti_revoke", "Foolllll", "QQ防撤回插件", "1.0",
+    "astrbot_plugin_anti_revoke", "Foolllll", "QQ防撤回插件", "1.1",
     "https://github.com/Foolllll-J/astrbot_plugin_anti_revoke",
 )
 class AntiRevoke(Star):
@@ -206,6 +206,7 @@ class AntiRevoke(Star):
         super().__init__(context)
         self.monitor_groups = [str(g) for g in config.get("monitor_groups", []) or []]
         self.target_receivers = [str(r) for r in config.get("target_receivers", []) or []]
+        self.target_groups = [str(g) for g in config.get("target_groups", []) or []]
         self.ignore_senders = [str(s) for s in config.get("ignore_senders", []) or []]
         self.instance_id = "AntiRevoke"
         self.cache_expiration_time = int(config.get("cache_expiration_time", 300))
@@ -630,28 +631,33 @@ class AntiRevoke(Star):
                     
                     logger.info(f"[{self.instance_id}] 合并转发撤回 - 群: {group_name}, 发送者: {member_nickname}")
                     
-                    # 向每个接收者转发
-                    for index, target_id in enumerate(self.target_receivers, 1):
+                    # 准备所有通知目标
+                    targets = [("private", tid) for tid in self.target_receivers] + [("group", tid) for tid in self.target_groups]
+                    
+                    # 向每个目标转发
+                    for target_type, target_id in targets:
+                    # 循环已在上方替换
                         target_id_str = str(target_id)
                         
                         header = self._create_recall_notification_header(group_name, group_id, member_nickname, sender_id, timestamp)
                         notification_text = f"{header}\n--------------------\n以下是撤回的聊天记录："
                         try:
-                            await client.send_private_msg(user_id=int(target_id_str), message=notification_text)
+                            if target_type == "private":
+                                await client.send_private_msg(user_id=int(target_id_str), message=notification_text)
+                            else:
+                                await client.send_group_msg(group_id=int(target_id_str), message=notification_text)
                             await asyncio.sleep(0.5)
                         except Exception as e:
-                            logger.error(f"[{self.instance_id}] 发送合并转发通知失败到 {target_id_str}: {e}")
+                            logger.error(f"[{self.instance_id}] 发送合并转发通知失败到 {target_type} {target_id_str}: {e}")
                             continue
                         
                         try:
-                            await client.api.call_action(
-                                "forward_friend_single_msg",
-                                user_id=int(target_id_str),
-                                message_id=relay_msg_id
-                            )
-                            logger.debug(f"[{self.instance_id}] 已将合并转发消息转发给 {target_id_str}")
+                            action = "forward_friend_single_msg" if target_type == "private" else "forward_group_single_msg"
+                            params = {"user_id": int(target_id_str)} if target_type == "private" else {"group_id": int(target_id_str)}
+                            await client.api.call_action(action, message_id=relay_msg_id, **params)
+                            logger.debug(f"[{self.instance_id}] 已将合并转发消息转发给 {target_type} {target_id_str}")
                         except Exception as e:
-                            logger.error(f"[{self.instance_id}] 转发合并消息失败到 {target_id_str}: {e}")
+                            logger.error(f"[{self.instance_id}] 转发合并消息失败到 {target_type} {target_id_str}: {e}")
                     
                     # 立即撤回中转群的消息
                     if self.auto_recall_relay:
@@ -701,7 +707,8 @@ class AntiRevoke(Star):
                     other_components = [comp for comp in components if getattr(comp.type, 'name', 'unknown') not in ['Video', 'Record', 'Json', 'File', 'Forward']]
                     
                     async with aiohttp.ClientSession() as session:
-                        for target_id in self.target_receivers:
+                        targets = [("private", tid) for tid in self.target_receivers] + [("group", tid) for tid in self.target_groups]
+                        for target_type, target_id in targets:
                             target_id_str = str(target_id)
                             
                             notification_prefix = self._create_recall_notification_header(group_name, group_id, member_nickname, sender_id, timestamp)
@@ -727,13 +734,19 @@ class AntiRevoke(Star):
 
                                 if len(gocq_content_array) > 1 or warning_text:
                                     try:
-                                        await client.send_private_msg(user_id=int(target_id_str), message=gocq_content_array)
-                                    except Exception as e: logger.error(f"[{self.instance_id}] ❌ 合并消息转发失败到 {target_id_str}：{e}\n{traceback.format_exc()}")
+                                        if target_type == "private":
+                                            await client.send_private_msg(user_id=int(target_id_str), message=gocq_content_array)
+                                        else:
+                                            await client.send_group_msg(group_id=int(target_id_str), message=gocq_content_array)
+                                    except Exception as e: logger.error(f"[{self.instance_id}] ❌ 合并消息转发失败到 {target_type} {target_id_str}：{e}\n{traceback.format_exc()}")
                             else:
                                 final_notification_text = f"{notification_prefix}{warning_text}\n--------------------\n内容将分条发送。"
                                 try:
-                                    await client.send_private_msg(user_id=int(target_id_str), message=final_notification_text)
-                                except Exception as e: logger.error(f"[{self.instance_id}] ❌ 发送通知头失败到 {target_id_str}：{e}\n{traceback.format_exc()} "); continue
+                                    if target_type == "private":
+                                        await client.send_private_msg(user_id=int(target_id_str), message=final_notification_text)
+                                    else:
+                                        await client.send_group_msg(group_id=int(target_id_str), message=final_notification_text)
+                                except Exception as e: logger.error(f"[{self.instance_id}] ❌ 发送通知头失败到 {target_type} {target_id_str}：{e}\n{traceback.format_exc()} "); continue
                                 
                                 await asyncio.sleep(0.5)
                                 
@@ -750,8 +763,11 @@ class AntiRevoke(Star):
                                         else:
                                             content_message.extend(message_parts)
                                         try:
-                                            await client.send_private_msg(user_id=int(target_id_str), message=content_message)
-                                        except Exception as e: logger.error(f"[{self.instance_id}] ❌ 发送非特殊内容失败到 {target_id_str}：{e}\n{traceback.format_exc()}")
+                                            if target_type == "private":
+                                                await client.send_private_msg(user_id=int(target_id_str), message=content_message)
+                                            else:
+                                                await client.send_group_msg(group_id=int(target_id_str), message=content_message)
+                                        except Exception as e: logger.error(f"[{self.instance_id}] ❌ 发送非特殊内容失败到 {target_type} {target_id_str}：{e}\n{traceback.format_exc()}")
                             
                             for comp in special_components:
                                 await asyncio.sleep(0.5)
@@ -763,9 +779,12 @@ class AntiRevoke(Star):
                                     final_parts_to_send = prefix_part + content_parts
                                 
                                 try:
-                                    await client.send_private_msg(user_id=int(target_id_str), message=final_parts_to_send)
+                                    if target_type == "private":
+                                        await client.send_private_msg(user_id=int(target_id_str), message=final_parts_to_send)
+                                    else:
+                                        await client.send_group_msg(group_id=int(target_id_str), message=final_parts_to_send)
                                 except Exception as e: 
-                                    logger.error(f"[{self.instance_id}] ❌ 发送特殊内容 ({comp_type_name}) 失败到 {target_id_str}：{e}\n{traceback.format_exc()}")
+                                    logger.error(f"[{self.instance_id}] ❌ 发送特殊内容 ({comp_type_name}) 失败到 {target_type} {target_id_str}：{e}\n{traceback.format_exc()}")
                 
                 finally:
                     if local_files_to_cleanup: asyncio.create_task(_cleanup_local_files(local_files_to_cleanup))
