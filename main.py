@@ -582,10 +582,13 @@ class AntiRevoke(Star):
             logger.error(f"[{self.instance_id}] 缓存消息失败 (ID: {message_id})：{e}\n{traceback.format_exc()}")
         return None
 
-    def _create_recall_notification_header(self, group_name: str, group_id: str, member_nickname: str, sender_id: str, timestamp: int) -> str:
+    def _create_recall_notification_header(self, group_name: str, group_id: str, member_nickname: str, sender_id: str, operator_nickname: str, operator_id: str, timestamp: int) -> str:
         """生成统一的撤回通知消息头"""
         message_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp)) if timestamp else "未知时间"
-        return f"【撤回提醒】\n群聊：{group_name} ({group_id})\n发送者：{member_nickname} ({sender_id})\n时间：{message_time_str}"
+        if operator_id == sender_id:
+            return f"【撤回提醒】\n群聊：{group_name} ({group_id})\n发送者：{member_nickname} ({sender_id})\n时间：{message_time_str}"
+        else
+            return f"【撤回提醒】\n群聊：{group_name} ({group_id})\n发送者：{member_nickname} ({sender_id})\n操作者：{operator_nickname} ({operator_id})\n时间：{message_time_str}"
 
     @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
@@ -596,6 +599,7 @@ class AntiRevoke(Star):
         if post_type == "notice" and get_value(raw_message, "notice_type") == "group_recall":
             group_id = str(get_value(raw_message, "group_id"))
             message_id = str(get_value(raw_message, "message_id"))
+            operator_id = str(get_value(raw_message, "operator_id"))
             if group_id not in self.monitor_groups or not message_id: return None
             
             file_path = next(self.temp_path.glob(f"*_{group_id}_{message_id}.json"), None)
@@ -631,8 +635,8 @@ class AntiRevoke(Star):
                 try:
                     client = event.bot
                     
-                    # 获取群名和用户名
-                    group_name, member_nickname = str(group_id), str(sender_id)
+                    # 获取群名和用户名和操作员
+                    group_name, member_nickname, operator_nickname = str(group_id), str(sender_id), str(operator_id)
                     try:
                         group_info = await client.api.call_action('get_group_info', group_id=int(group_id))
                         group_name = group_info.get('group_name', group_name)
@@ -642,8 +646,13 @@ class AntiRevoke(Star):
                         card, nickname = member_info.get('card', ''), member_info.get('nickname', '')
                         member_nickname = card or nickname or member_nickname
                     except: pass
+                    try:
+                        operator_info = await client.api.call_action('get_group_member_info', group_id=int(group_id), user_id=int(operator_id))
+                        card, nickname = operator_info.get('card', ''), operator_info.get('nickname', '')
+                        operator_nickname = card or nickname or operator_nickname
+                    except: pass
                     
-                    logger.info(f"[{self.instance_id}] 合并转发撤回 - 群: {group_name}, 发送者: {member_nickname}")
+                    logger.info(f"[{self.instance_id}] 合并转发撤回 - 群: {group_name}, 发送者: {member_nickname}, 操作者: {operator_nickname} ({operator_id})")
                     
                     # 准备所有通知目标
                     targets = [("private", tid) for tid in self.target_receivers] + [("group", tid) for tid in self.target_groups]
@@ -653,7 +662,7 @@ class AntiRevoke(Star):
                     # 循环已在上方替换
                         target_id_str = str(target_id)
                         
-                        header = self._create_recall_notification_header(group_name, group_id, member_nickname, sender_id, timestamp)
+                        header = self._create_recall_notification_header(group_name, group_id, member_nickname, sender_id, operator_nickname, operator_id, timestamp)
                         notification_text = f"{header}\n--------------------\n以下是撤回的聊天记录："
                         try:
                             if target_type == "private":
@@ -707,12 +716,15 @@ class AntiRevoke(Star):
                     timestamp = cached_data.get("timestamp")
                     client = event.bot
                     
-                    group_name, member_nickname = str(group_id), str(sender_id)
+                    group_name, member_nickname,operator_nickname = str(group_id), str(sender_id), str(operator_id)
                     try:
                         group_info = await client.api.call_action('get_group_info', group_id=int(group_id)); group_name = group_info.get('group_name', group_name)
                     except: pass
                     try:
                         member_info = await client.api.call_action('get_group_member_info', group_id=int(group_id), user_id=int(sender_id)); card, nickname = member_info.get('card', ''), member_info.get('nickname', ''); member_nickname = card or nickname or member_nickname
+                    except: pass
+                    try:
+                        operator_info = await client.api.call_action('get_group_member_info', group_id=int(group_id), user_id=int(operator_id)); card, nickname = operator_info.get('card', ''), operator_info.get('nickname', ''); operator_nickname = card or nickname or operator_nickname
                     except: pass
 
                     logger.info(f"[{self.instance_id}] 发现撤回。群: {group_name} ({group_id}), 发送者: {member_nickname} ({sender_id})")
@@ -725,7 +737,7 @@ class AntiRevoke(Star):
                         for target_type, target_id in targets:
                             target_id_str = str(target_id)
                             
-                            notification_prefix = self._create_recall_notification_header(group_name, group_id, member_nickname, sender_id, timestamp)
+                            notification_prefix = self._create_recall_notification_header(group_name, group_id, member_nickname,sender_id, operator_nickname, operator_id, timestamp)
                             warning_text = f"\n⚠️ 注意：包含不支持的组件：{', '.join(unsupported_types)}" if unsupported_types else ""
                             
                             if not special_components:
