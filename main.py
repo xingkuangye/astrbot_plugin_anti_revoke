@@ -198,7 +198,7 @@ async def _process_component_and_get_gocq_part(
     return gocq_parts
 
 @register(
-    "astrbot_plugin_anti_revoke", "Foolllll", "QQ防撤回插件", "1.1.1",
+    "astrbot_plugin_anti_revoke", "Foolllll", "QQ防撤回插件", "1.1.2",
     "https://github.com/Foolllll-J/astrbot_plugin_anti_revoke",
 )
 class AntiRevoke(Star):
@@ -511,6 +511,9 @@ class AntiRevoke(Star):
                             original_suffix = Path(local_path).suffix or '.amr'
                             permanent_path = self.voice_cache_path / f"{timestamp_ms}{original_suffix}"
                             shutil.copy(local_path, permanent_path)
+                            # ========== 添加权限设置 ==========
+                            os.chmod(permanent_path, 0o644)  # 设置文件权限为 rw-r--r--
+                            # ================================
 
                             setattr(comp, 'file', str(permanent_path.absolute()))
                             asyncio.create_task(delayed_delete(self.cache_expiration_time, permanent_path))
